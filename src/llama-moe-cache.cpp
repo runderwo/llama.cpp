@@ -282,9 +282,42 @@ struct moe_cache_lru {
             move(s, class_of(key));
             fills.push_back({ e, s });
         }
-        clock[il] += n_tokens;
-        return true;
+    clock[il] += n_tokens;
+    return true;
+}
+
+int32_t n_used() const {
+    return n_filled;
+}
+
+void evict(int32_t n_evict, std::vector<int32_t> & evict, std::vector<int32_t> & evict_slots) {
+    evict.clear();
+    evict_slots.clear();
+    for (int c = 0; c < n_class && (int32_t)evict.size() < n_evict; ++c) {
+        for (int32_t s = head[c]; s >= 0 && (int32_t)evict.size() < n_evict; s = next[s]) {
+            if (key_of[s] >= 0) {
+                evict.push_back(key_expert(key_of[s]));
+                evict_slots.push_back(s);
+            }
+        }
     }
+    n_filled -= evict.size();
+}
+
+int32_t get_slot(int32_t e) const {
+    for (int32_t s = 0; s < n_slots; ++s) {
+        if (key_of[s] >= 0 && key_expert(key_of[s]) == e) {
+            return s;
+        }
+    }
+    return -1;
+}
+
+void promote(int32_t e, int32_t s) {
+    key_of[s] = make_key(key_layer(key_of[s]), e);
+    move(s, class_of(key_of[s]));
+    ++n_filled;
+}
 };
 
 // gate, up, down or gate_up, down
@@ -399,8 +432,15 @@ struct llama_moe_cache::impl {
     // views used by copy_experts
     ggml_context_ptr ctx_views;
 
-    impl(const llama_model & model, bool no_alloc, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, float cpu_share) :
-            n_expert_used(model.hparams.n_expert_used_max()), layers(model.layers.size()), cpu_share(std::clamp(cpu_share, 0.0f, 1.0f)) {
+    // idle window tracking for dynamic rebalancing
+    int64_t t_idle_start_ms = 0;
+    bool    idle_window_active = false;
+    bool    rebalance_enabled = false;
+
+    bool rebalance();
+
+    impl(const llama_model & model, bool no_alloc, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, float cpu_share, bool rebalance_enabled) :
+            n_expert_used(model.hparams.n_expert_used_max()), layers(model.layers.size()), cpu_share(std::clamp(cpu_share, 0.0f, 1.0f)), rebalance_enabled(rebalance_enabled) {
         for (size_t i = 0; i < backends.size(); ++i) {
             const auto dev_type = ggml_backend_dev_type(ggml_backend_get_device(backends[i]));
             if (dev_type == GGML_BACKEND_DEVICE_TYPE_GPU || dev_type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
@@ -845,6 +885,11 @@ struct llama_moe_cache::impl {
                 }
                 ggml_backend_tensor_set_async(backend, bank, (const uint8_t *) w->data + fills[i].expert*expert_size, fills[i].slot*expert_size, n*expert_size);
                 bytes += n*expert_size;
+                for (size_t j = 0; j < n; ++j) {
+                    const int32_t expert_idx = fills[i + j].expert;
+                    const int32_t slot_idx = fills[i + j].slot;
+                    LLAMA_LOG_INFO("%s: migrated expert L=%d E=%d to VRAM slot=%d\n", __func__, il, expert_idx, slot_idx);
+                }
                 i += n;
             }
         }
@@ -876,10 +921,50 @@ struct llama_moe_cache::impl {
             LLAMA_LOG_INFO("llama_moe_cache: large batches: %zu experts copied from the cache, %.2f MiB\n", stats_copy.hits, stats_copy.bytes/1024.0/1024.0);
         }
     }
+
+    bool rebalance_group(group & g) {
+        const int32_t n_expert = g.ref.size();
+        if (g.n_slots >= n_expert) {
+            return false;
+        }
+
+        const int32_t n_used = g.lru.n_used();
+        if (n_used <= g.n_slots) {
+            return false;
+        }
+
+        const int32_t n_evict = n_used - g.n_slots;
+
+        std::vector<int32_t> evict;
+        std::vector<int32_t> evict_slots;
+        evict.reserve(n_evict);
+        evict_slots.reserve(n_evict);
+
+        LLAMA_LOG_DEBUG("%s: evicting %d experts from group (device %d)\n", __func__, n_evict, g.id);
+
+        g.lru.evict(n_evict, evict, evict_slots);
+
+        std::vector<std::pair<int32_t, int32_t>> evicted_experts;
+        evicted_experts.reserve(evict.size());
+        for (size_t i = 0; i < evict.size(); ++i) {
+            const int32_t expert_idx = evict[i];
+            const int32_t slot_idx = evict_slots[i];
+            evicted_experts.push_back({expert_idx, slot_idx});
+        }
+
+        for (size_t il_idx = 0; il_idx < g.layers.size(); ++il_idx) {
+            const int32_t il = g.layers[il_idx];
+            for (const auto & exp : evicted_experts) {
+                LLAMA_LOG_INFO("%s: evicted expert L=%d E=%d from VRAM slot=%d\n", __func__, il, exp.first, exp.second);
+            }
+        }
+
+        return !evict.empty();
+    }
 };
 
-llama_moe_cache::llama_moe_cache(const llama_model & model, bool no_alloc, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, float cpu_share) :
-    pimpl(new impl(model, no_alloc, backends, bufts, size, cpu_share)) {
+llama_moe_cache::llama_moe_cache(const llama_model & model, bool no_alloc, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, float cpu_share, bool rebalance_enabled) :
+    pimpl(new impl(model, no_alloc, backends, bufts, size, cpu_share, rebalance_enabled)) {
 }
 
 llama_moe_cache::~llama_moe_cache() = default;
@@ -981,4 +1066,57 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_moe_cache::memory_breakdown()
         res[ggml_backend_buffer_get_type(pimpl->buf_host.get())] += pimpl->buf_host_size;
     }
     return res;
+}
+
+bool llama_moe_cache::rebalance() {
+    return pimpl->rebalance();
+}
+
+bool llama_moe_cache::impl::rebalance() {
+    if (!rebalance_enabled) {
+        return false;
+    }
+
+    const int64_t t_now_ms = ggml_time_ms();
+
+    if (!idle_window_active) {
+        t_idle_start_ms = t_now_ms;
+        idle_window_active = true;
+        return false;
+    }
+
+    const int64_t idle_window_ms = t_now_ms - t_idle_start_ms;
+    if (idle_window_ms < 2000) {
+        return false;
+    }
+
+    LLAMA_LOG_DEBUG("%s: idle window %lld ms, checking rebalance\n", __func__, (long long)idle_window_ms);
+
+    bool rebalanced = false;
+    for (auto & g : groups) {
+        const int32_t n_expert = g.ref.size();
+        if (g.n_slots < n_expert) {
+            continue;
+        }
+
+        const int32_t n_used = g.lru.n_used();
+        if (n_used == 0) {
+            continue;
+        }
+
+        const float turnover = 1.0f - static_cast<float>(n_used) / n_expert;
+        if (turnover < 0.10f) {
+            LLAMA_LOG_DEBUG("%s: group %d turnover %.2f%% < 10%% threshold\n", __func__, g.id, turnover * 100.0f);
+            continue;
+        }
+
+        LLAMA_LOG_DEBUG("%s: group %d rebalancing (turnover %.2f%%, used %d/%d slots)\n", __func__, g.id, turnover * 100.0f, n_used, g.n_slots);
+
+        if (rebalance_group(g)) {
+            rebalanced = true;
+        }
+    }
+
+    idle_window_active = false;
+    return rebalanced;
 }

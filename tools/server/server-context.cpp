@@ -22,6 +22,8 @@
 #include "speculative.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
+#include "llama-moe-cache.h"
+#include "llama-context.h"
 #include "base64.hpp"
 
 #include <algorithm>
@@ -1111,6 +1113,8 @@ private:
 
     common_speculative_ptr spec;
 
+    std::unique_ptr<llama_moe_cache> moe_cache;
+
     bool add_bos_token = true;
 
     int32_t n_ctx; // total context for all clients / slots
@@ -1336,6 +1340,14 @@ private:
         if (ctx_tgt == nullptr) {
             SRV_ERR("failed to create_context with model '%s'\n", params_base.model.path.c_str());
             return false;
+        }
+
+        // initialize MoE cache if enabled
+        if (params_base.moe_cache_size > 0) {
+            const llama_model & model = *llama_get_model(ctx_tgt);
+            const std::vector<ggml_backend_t> & backend_ptrs = ctx_tgt->get_backend_ptrs();
+            const std::vector<ggml_backend_buffer_type_t> & backend_buft = ctx_tgt->get_backend_buft();
+            moe_cache = std::make_unique<llama_moe_cache>(model, false, backend_ptrs, backend_buft, params_base.moe_cache_size * 1024 * 1024, 0.0f, params_base.moe_cache_rebalance);
         }
 
         vocab = llama_model_get_vocab(model_tgt);
@@ -3536,6 +3548,11 @@ private:
                 SRV_TRC("%s", "all slots are idle\n");
 
                 metrics_flush_idle();
+
+                // rebalance MoE cache if enabled
+                if (moe_cache) {
+                    moe_cache->rebalance();
+                }
 
                 return; // skip further processing
 

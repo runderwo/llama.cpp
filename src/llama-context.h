@@ -285,6 +285,10 @@ public:
 
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
+    const std::vector<ggml_backend_ptr> & get_backends() const { return backends; }
+    const std::vector<ggml_backend_buffer_type_t> & get_backend_buft() const { return backend_buft; }
+    const std::vector<ggml_backend_t> & get_backend_ptrs() const { return backend_ptrs; }
+
 private:
     llm_graph_result * get_gf_res_prev();
 
